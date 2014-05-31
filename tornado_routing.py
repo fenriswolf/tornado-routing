@@ -8,7 +8,10 @@ import inspect
 import re
 from collections import OrderedDict
 
-from tornado.web import Application, RequestHandler, HTTPError
+from tornado.web import Application, RequestHandler, HTTPError, _has_stream_request_body
+from tornado import gen
+from tornado.concurrent import is_future
+from tornado import iostream
 
 app_routing_log = logging.getLogger("tornado.application.routing")
 
@@ -58,10 +61,58 @@ class RequestRoutingHandler(RequestHandler):
         else:
             raise HTTPError(404, "")
             
-    def _execute_method(self):
-        if not self._finished:
-            func_name = self._get_func_name()
-            method = getattr(self, func_name)
-            self._when_complete(method(*self.path_args, **self.path_kwargs),
-                                self._execute_finish)
+    @gen.coroutine
+    def _execute(self, transforms, *args, **kwargs):
+        """Executes this request with the given output transforms."""
+        self._transforms = transforms
+        try:
+            if self.request.method not in self.SUPPORTED_METHODS:
+                raise HTTPError(405)
+            self.path_args = [self.decode_argument(arg) for arg in args]
+            self.path_kwargs = dict((k, self.decode_argument(v, name=k))
+                                    for (k, v) in kwargs.items())
+            # If XSRF cookies are turned on, reject form submissions without
+            # the proper cookie
+            if self.request.method not in ("GET", "HEAD", "OPTIONS") and \
+                    self.application.settings.get("xsrf_cookies"):
+                self.check_xsrf_cookie()
+
+            result = self.prepare()
+            if is_future(result):
+                result = yield result
+            if result is not None:
+                raise TypeError("Expected None, got %r" % result)
+            if self._prepared_future is not None:
+                # Tell the Application we've finished with prepare()
+                # and are ready for the body to arrive.
+                self._prepared_future.set_result(None)
+            if self._finished:
+                return
+
+            if _has_stream_request_body(self.__class__):
+                # In streaming mode request.body is a Future that signals
+                # the body has been completely received.  The Future has no
+                # result; the data has been passed to self.data_received
+                # instead.
+                try:
+                    yield self.request.body
+                except iostream.StreamClosedError:
+                    return
+
+            method = getattr(self, self._get_func_name())
+            result = method(*self.path_args, **self.path_kwargs)
+            if is_future(result):
+                result = yield result
+            if result is not None:
+                raise TypeError("Expected None, got %r" % result)
+            if self._auto_finish and not self._finished:
+                self.finish()
+        except Exception as e:
+            self._handle_request_exception(e)
+            if (self._prepared_future is not None and
+                    not self._prepared_future.done()):
+                # In case we failed before setting _prepared_future, do it
+                # now (to unblock the HTTP server).  Note that this is not
+                # in a finally block to avoid GC issues prior to Python 3.4.
+                self._prepared_future.set_result(None)
             
