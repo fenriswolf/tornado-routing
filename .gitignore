@@ -1,0 +1,7 @@
+*.pyc
+*.pyo
+.project
+.pydevproject
+/tornado_routing.egg-info/
+build/
+dist/
